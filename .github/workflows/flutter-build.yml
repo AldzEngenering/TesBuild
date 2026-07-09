@@ -1,0 +1,353 @@
+name: Flutter APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: 'Release URL for ZIP download'
+        required: true
+        type: string
+      tag:
+        description: 'Release tag'
+        required: true
+        type: string
+      build_type:
+        description: 'Build type (debug/release)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - debug
+          - release
+
+env:
+  FLUTTER_VERSION: '3.24.5'
+  JAVA_VERSION: '17'
+  ANDROID_SDK_VERSION: '34'
+  ANDROID_BUILD_TOOLS: '34.0.0'
+
+jobs:
+  build:
+    name: Build Flutter APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      # ==================== CHECKOUT ====================
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ==================== SETUP JAVA ====================
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      # ==================== SETUP ANDROID SDK ====================
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-${{ env.ANDROID_SDK_VERSION }}
+            build-tools;${{ env.ANDROID_BUILD_TOOLS }}
+            extras;android;m2repository
+            extras;google;m2repository
+
+      - name: Accept Android Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+          yes | $ANDROID_HOME/tools/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+      # ==================== SETUP FLUTTER ====================
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter Doctor
+        run: |
+          flutter doctor -v
+          flutter --version
+
+      # ==================== DOWNLOAD PROJECT ====================
+      - name: Download Project ZIP
+        id: download_zip
+        run: |
+          mkdir -p project
+          cd project
+          
+          # Download from release URL
+          echo "Downloading from: ${{ github.event.inputs.release_url }}"
+          curl -L -o project.zip "${{ github.event.inputs.release_url }}"
+          
+          # Verify download
+          if [ ! -f project.zip ]; then
+            echo "❌ Failed to download project.zip"
+            exit 1
+          fi
+          
+          if [ ! -s project.zip ]; then
+            echo "❌ Downloaded file is empty"
+            exit 1
+          fi
+          
+          # Extract
+          echo "📦 Extracting project..."
+          unzip -q project.zip -d extracted/
+          
+          # Find the actual project directory (if nested)
+          cd extracted
+          if [ -f pubspec.yaml ]; then
+            echo "✅ pubspec.yaml found in root"
+            mv ../project.zip ../extracted.zip 2>/dev/null || true
+          else
+            # Check if there's a single subdirectory with pubspec.yaml
+            subdir=$(find . -maxdepth 1 -type d -not -name "." | head -1)
+            if [ -n "$subdir" ] && [ -f "$subdir/pubspec.yaml" ]; then
+              echo "📁 Moving files from $subdir to root"
+              mv "$subdir"/* . 2>/dev/null || true
+              mv "$subdir"/.[!.]* . 2>/dev/null || true
+              rmdir "$subdir" 2>/dev/null || true
+            fi
+          fi
+          
+          # Verify pubspec.yaml exists
+          if [ ! -f pubspec.yaml ]; then
+            echo "❌ pubspec.yaml not found in project root"
+            echo "📂 Directory contents:"
+            ls -la
+            exit 1
+          fi
+          
+          echo "✅ Project structure verified"
+          ls -la
+
+      # ==================== CLEANUP UNNECESSARY FILES ====================
+      - name: Cleanup Project
+        run: |
+          cd project/extracted
+          
+          # Remove unnecessary files to speed up build
+          echo "🧹 Cleaning unnecessary files..."
+          
+          # Remove build artifacts
+          rm -rf build/ .dart_tool/ .flutter-plugins .flutter-plugins-dependencies 2>/dev/null || true
+          
+          # Remove IDE files
+          rm -rf .idea/ .vscode/ .git/ .svn/ 2>/dev/null || true
+          
+          # Remove test files
+          rm -rf test/ integration_test/ 2>/dev/null || true
+          
+          # Remove documentation
+          rm -f README.md CHANGELOG.md LICENSE 2>/dev/null || true
+          
+          # Remove Android build cache
+          rm -rf android/.gradle/ android/build/ android/app/build/ 2>/dev/null || true
+          
+          # Remove iOS build cache
+          rm -rf ios/Pods/ ios/.symlinks/ ios/Flutter/Flutter.framework/ 2>/dev/null || true
+          
+          echo "✅ Cleanup completed"
+
+      # ==================== FLUTTER CLEAN ====================
+      - name: Flutter Clean
+        run: |
+          cd project/extracted
+          flutter clean
+
+      # ==================== FLUTTER PUB GET ====================
+      - name: Flutter Pub Get
+        run: |
+          cd project/extracted
+          flutter pub get
+          flutter pub upgrade --major-versions
+
+      # ==================== ANDROID GRADLE SETUP ====================
+      - name: Setup Android Gradle
+        run: |
+          cd project/extracted
+          
+          # Ensure android folder exists
+          if [ ! -d "android" ]; then
+            echo "❌ Android folder not found! Creating..."
+            flutter create --platforms=android .
+          fi
+          
+          # Create gradle.properties if missing
+          if [ ! -f "android/gradle.properties" ]; then
+            echo "📝 Creating gradle.properties..."
+            cat > android/gradle.properties << 'EOF'
+            org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=2G -XX:+HeapDumpOnOutOfMemoryError
+            android.useAndroidX=true
+            android.enableJetifier=true
+            android.enableR8=true
+            android.enableDexingArtifactTransform=true
+            EOF
+          fi
+          
+          # Update Gradle wrapper if needed
+          chmod +x android/gradlew 2>/dev/null || true
+
+      # ==================== BUILD APK ====================
+      - name: Build APK
+        id: build_apk
+        run: |
+          cd project/extracted
+          
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          
+          echo "🔨 Building $BUILD_TYPE APK..."
+          
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug --split-per-abi
+          else
+            flutter build apk --release --split-per-abi
+          fi
+          
+          # Check if build succeeded
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            APK_PATH="build/app/outputs/flutter-apk/app-debug.apk"
+          else
+            APK_PATH="build/app/outputs/flutter-apk/app-release.apk"
+          fi
+          
+          if [ -f "$APK_PATH" ]; then
+            echo "✅ APK built successfully at: $APK_PATH"
+            echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+          else
+            echo "❌ APK build failed - looking for APK files..."
+            find . -name "*.apk" -type f 2>/dev/null || echo "No APK found"
+            exit 1
+          fi
+          
+          # List all APKs
+          echo "📦 APK files:"
+          find . -name "*.apk" -type f 2>/dev/null
+
+      # ==================== COLLECT APKS ====================
+      - name: Collect APKs
+        id: collect_apks
+        run: |
+          cd project/extracted
+          
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          
+          mkdir -p ../apks
+          
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            # Debug: collect all APKs
+            find . -name "*.apk" -type f -exec cp {} ../apks/ \; 2>/dev/null || true
+          else
+            # Release: collect split APKs
+            APK_DIR="build/app/outputs/apk/release"
+            if [ -d "$APK_DIR" ]; then
+              find "$APK_DIR" -name "*.apk" -type f -exec cp {} ../apks/ \; 2>/dev/null || true
+            fi
+          fi
+          
+          echo "📦 Collected APKs:"
+          ls -la ../apks/
+
+      # ==================== UPLOAD TO RELEASE ====================
+      - name: Upload APK to Release
+        id: upload_apk
+        run: |
+          cd project
+          
+          APK_FILES=$(ls -1 apks/*.apk 2>/dev/null || echo "")
+          
+          if [ -z "$APK_FILES" ]; then
+            echo "❌ No APK files found to upload!"
+            exit 1
+          fi
+          
+          echo "📤 Uploading APK files to release..."
+          
+          for APK in apks/*.apk; do
+            if [ -f "$APK" ]; then
+              FILENAME=$(basename "$APK")
+              APK_SIZE=$(du -h "$APK" | cut -f1)
+              echo "  📄 Uploading: $FILENAME ($APK_SIZE)"
+              
+              # Upload using GitHub CLI
+              gh release upload "${{ github.event.inputs.tag }}" "$APK" \
+                --repo "${{ github.repository }}" \
+                --clobber || {
+                echo "⚠️ Failed to upload $FILENAME, trying alternative..."
+                # Alternative: use curl
+                UPLOAD_URL=$(gh release view "${{ github.event.inputs.tag }}" --json uploadUrl -q .uploadUrl)
+                curl -L -X POST "$UPLOAD_URL?name=$FILENAME" \
+                  -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  -H "Content-Type: application/vnd.android.package-archive" \
+                  --data-binary "@$APK"
+              }
+            fi
+          done
+          
+          echo "✅ APK upload completed"
+          
+          # Get release URL
+          RELEASE_URL=$(gh release view "${{ github.event.inputs.tag }}" --json htmlUrl -q .htmlUrl)
+          echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+
+      # ==================== VERIFY APK STRUCTURE ====================
+      - name: Verify APK Structure
+        run: |
+          cd project/apks
+          
+          echo "🔍 Verifying APK structure..."
+          
+          for APK in *.apk; do
+            if [ -f "$APK" ]; then
+              echo "📦 Checking: $APK"
+              
+              # Check if APK is valid
+              if file "$APK" | grep -q "Zip archive"; then
+                echo "  ✅ Valid APK file"
+                
+                # List contents to verify structure
+                echo "  📋 APK Contents:"
+                unzip -l "$APK" | head -30 || echo "  ⚠️ Could not list contents"
+              else
+                echo "  ❌ Invalid APK file!"
+              fi
+            fi
+          done
+
+      # ==================== FINAL STATUS ====================
+      - name: Build Summary
+        run: |
+          echo "## 🎉 Build Completed Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Build Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag:** ${{ github.event.inputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type:** ${{ github.event.inputs.build_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Flutter:** ${{ env.FLUTTER_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Java:** ${{ env.JAVA_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### 📁 APK Files" >> $GITHUB_STEP_SUMMARY
+          cd project/apks 2>/dev/null || echo ""
+          ls -la *.apk 2>/dev/null | awk '{print "- " $9 " (" $5 " bytes)"}' >> $GITHUB_STEP_SUMMARY || echo "- No APK files found" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [View Release](${{ steps.upload_apk.outputs.release_url }})" >> $GITHUB_STEP_SUMMARY
+
+      # ==================== CLEANUP ====================
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "🧹 Cleaning up workspace..."
+          rm -rf project/extracted 2>/dev/null || true
+          echo "✅ Cleanup completed"
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
